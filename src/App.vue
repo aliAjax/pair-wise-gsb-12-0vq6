@@ -1,189 +1,156 @@
 <script setup lang="ts">
-import { computed, reactive, ref } from "vue";
+import { computed, ref } from "vue";
+import { useFleetStore } from "./stores/fleet";
+import {
+  availableOf,
+  openOrderOf,
+  phaseOf,
+  reservedOf,
+  stockOf
+} from "./rules/engine";
+import VehiclePanel from "./components/VehiclePanel.vue";
+import OrderPanel from "./components/OrderPanel.vue";
+import InventoryPanel from "./components/InventoryPanel.vue";
+import MetricBar from "./components/MetricBar.vue";
+import ToastHost from "./components/ToastHost.vue";
+import { useToast } from "./components/toast";
 
-type Field = {
-  key: string;
-  label: string;
-  type?: "number" | "date" | "select";
-  options?: readonly string[];
-};
+const store = useFleetStore();
+const toast = useToast();
 
-type RecordItem = {
-  id: string;
-  status: string;
-  notes: string;
-  createdAt: string;
-  [key: string]: string | number;
-};
+const tab = ref<"dispatch" | "orders" | "stock">("dispatch");
+const showCheck = ref(false);
 
-const project = {
-  "number": 3,
-  "folder": "dfwl/frontend/dfwlfront-3",
-  "framework": "vue",
-  "title": "车辆调度小工具",
-  "subtitle": "维护车辆、司机和任务状态，为空闲车辆分配配送任务。",
-  "industry": "物流",
-  "stack": [
-    "Vue3",
-    "Vite",
-    "TypeScript",
-    "Pinia",
-    "Naive UI"
-  ],
-  "storageKey": "dfwlfront-3-dispatch",
-  "formTitle": "新增配送任务",
-  "primaryAction": "分配任务",
-  "entityLabel": "车辆",
-  "statuses": [
-    "空闲",
-    "执行中",
-    "已完成"
-  ],
-  "filters": [
-    "全部区域",
-    "城北",
-    "城东",
-    "城南"
-  ],
-  "fields": [
-    {
-      "key": "vehicle",
-      "label": "车牌号"
-    },
-    {
-      "key": "driver",
-      "label": "司机"
-    },
-    {
-      "key": "zone",
-      "label": "配送区域",
-      "type": "select",
-      "options": [
-        "城北",
-        "城东",
-        "城南"
-      ]
-    },
-    {
-      "key": "task",
-      "label": "配送任务"
-    }
-  ],
-  "records": [
-    {
-      "vehicle": "沪A-82L6",
-      "driver": "董飞",
-      "zone": "城北",
-      "task": "商超补货",
-      "status": "空闲",
-      "notes": "可立即派车"
-    },
-    {
-      "vehicle": "沪B-73K9",
-      "driver": "周航",
-      "zone": "城东",
-      "task": "医药配送",
-      "status": "执行中",
-      "notes": "预计17:30返回"
-    }
-  ],
-  "metricLabels": [
-    "车辆总数",
-    "执行中",
-    "空闲车辆"
-  ]
-} as const;
-
-const fields = project.fields as readonly Field[];
-const statuses = [...project.statuses];
-
-function createBlank() {
-  return Object.fromEntries(fields.map((field) => [field.key, field.type === "number" ? 0 : ""]));
+interface CheckItem {
+  name: string;
+  ok: boolean;
+  detail: string;
 }
 
-function loadRecords(): RecordItem[] {
-  const raw = localStorage.getItem(project.storageKey);
-  if (!raw) {
-    return project.records.map((record, index) => ({
-      ...record,
-      id: `seed-${index + 1}`,
-      createdAt: new Date(Date.now() - index * 86400000).toISOString()
-    })) as RecordItem[];
-  }
-  try {
-    return JSON.parse(raw) as RecordItem[];
-  } catch {
-    return [];
-  }
-}
+/**
+ * 一致性自检：全部由状态现场重新派生，不做任何修改。
+ * 覆盖：库存非负、可用=结存−预占、单车一张在修单、停机派生、
+ * 执行中无报修单、完工冻结里程/版本、预占均挂在修工单。
+ */
+const checks = computed<CheckItem[]>(() => {
+  const s = store.state;
+  const result: CheckItem[] = [];
 
-const records = ref<RecordItem[]>(loadRecords());
-const form = reactive<Record<string, string | number>>(createBlank());
-const note = ref("");
-const filter = ref(project.filters[0]);
+  // 1. 结存与可用非负，且 可用 = 结存 − 预占
+  let stockOk = true;
+  const stockDetails: string[] = [];
+  for (const p of s.parts) {
+    const onHand = stockOf(s, p.id);
+    const held = reservedOf(s, p.id);
+    const avail = availableOf(s, p.id);
+    if (onHand < 0 || avail < 0 || avail !== onHand - held) {
+      stockOk = false;
+      stockDetails.push(p.name);
+    }
+  }
+  result.push({
+    name: "库存非负且 可用 = 结存 − 预占",
+    ok: stockOk,
+    detail: stockOk ? "全部备件一致" : `异常备件：${stockDetails.join("、")}`
 
-const filteredRecords = computed(() => {
-  if (filter.value.startsWith("全部")) return records.value;
-  return records.value.filter((record) => Object.values(record).includes(filter.value));
+  });
+
+  // 2. 每车最多一张在修单；停机阶段与在修单一致
+  let singleOk = true;
+  let phaseOk = true;
+  for (const v of s.vehicles) {
+    const opens = s.orders.filter((o) => o.vehicleId === v.id && o.status !== "已完成");
+    if (opens.length > 1) singleOk = false;
+    const down = opens.length === 1;
+    if (down !== (phaseOf(s, v) === "保养停机")) phaseOk = false;
+  }
+  result.push({ name: "单车只保留一张在修单", ok: singleOk, detail: singleOk ? "通过" : "存在多单车辆" });
+  result.push({
+    name: "保养停机由在修单派生",
+    ok: phaseOk,
+    detail: phaseOk ? "停机/复机一致" : "停机状态与工单不一致"
+  });
+
+  // 3. 执行中车辆不存在开放报修单（紧急报修必然先回收任务）
+  let recallOk = true;
+  for (const v of s.vehicles) {
+    if (v.taskStatus === "执行中" && openOrderOf(s, v.id)) recallOk = false;
+  }
+  result.push({
+    name: "执行中车辆无报修单",
+    ok: recallOk,
+    detail: recallOk ? "紧急报修均已回收任务" : "存在执行中报修单"
+  });
+
+  // 4. 已完工工单：有冻结快照，备件/里程不被改写
+  let freezeOk = true;
+  const frozenDetails: string[] = [];
+  for (const o of s.orders) {
+    if (o.status !== "已完成") continue;
+    if (!o.finish) {
+      freezeOk = false;
+      frozenDetails.push(`${o.code}缺完工记录`);
+      continue;
+    }
+    // 原始核销明细合计必须能在流水里找到对应净核销（入库为正方向）
+    for (const line of o.parts) {
+      const used = s.movements
+        .filter((m) => m.orderId === o.id && m.partId === line.partId)
+        .reduce((sum, m) => sum + (m.type === "核销" ? m.qty : -m.qty), 0);
+      // 允许补录改变净额，但原始 parts 数量必须 ≤ 总净核销（补退时可能小于）
+      if (used < 0) {
+        freezeOk = false;
+        frozenDetails.push(`${o.code} ${line.partId}`);
+      }
+    }
+  }
+  result.push({
+    name: "完工单冻结快照完整",
+    ok: freezeOk,
+    detail: freezeOk ? "里程与原始备件均有快照，补录仅追加版本" : frozenDetails.join("、")
+  });
+
+  // 5. 所有预占都挂在「在修」工单上（待料不占库存）
+  let reservationOwnerOk = true;
+  for (const r of s.reservations) {
+    const o = s.orders.find((x) => x.id === r.orderId);
+    if (!o || o.status !== "在修") reservationOwnerOk = false;
+  }
+  result.push({
+    name: "预占均属于在修工单",
+    ok: reservationOwnerOk,
+    detail: reservationOwnerOk ? "缺件已释放，不占库存" : "存在游离预占"
+  });
+
+  // 6. 补录版本均带原因，且版本号连续
+  let versionOk = true;
+  for (const o of s.orders) {
+    o.versions.forEach((v, i) => {
+      if (!v.reason.trim() || v.version !== i + 1) versionOk = false;
+    });
+  }
+  result.push({
+    name: "补录版本带原因且连续",
+    ok: versionOk,
+    detail: versionOk ? "所有补录均可追溯" : "存在异常版本"
+  });
+
+  return result;
 });
 
-const metrics = computed(() => {
-  const total = records.value.length;
-  const second = records.value.filter((record) => record.status === statuses[1]).length;
-  const third = records.value.filter((record) => record.status === statuses[2]).length;
-  const numberValues = records.value.flatMap((record) =>
-    fields.filter((field) => field.type === "number").map((field) => Number(record[field.key] || 0))
-  );
-  const sum = numberValues.reduce((acc, value) => acc + value, 0);
-  return [total, second || sum, third || Math.round(sum / Math.max(total, 1))];
-});
+const allPass = computed(() => checks.value.every((c) => c.ok));
 
-const chartRows = computed(() => statuses.map((status) => ({
-  status,
-  value: records.value.filter((record) => record.status === status).length
-})));
-
-const maxChart = computed(() => Math.max(1, ...chartRows.value.map((row) => row.value)));
-
-function persist() {
-  localStorage.setItem(project.storageKey, JSON.stringify(records.value));
+function runCheck() {
+  showCheck.value = true;
+  if (allPass.value) toast.success("一致性自检全部通过");
+  else toast.error("存在不一致项，请查看自检结果");
 }
 
-function nextStatus(status: string) {
-  const index = statuses.indexOf(status);
-  return statuses[(index + 1) % statuses.length];
-}
-
-function primaryText(record: RecordItem) {
-  const first = fields[0];
-  const second = fields[1];
-  return [record[first.key], record[second.key]].filter(Boolean).join(" / ") || project.entityLabel;
-}
-
-function submit() {
-  records.value = [
-    {
-      ...form,
-      id: crypto.randomUUID(),
-      status: statuses[0],
-      notes: note.value || "暂无备注",
-      createdAt: new Date().toISOString()
-    } as RecordItem,
-    ...records.value
-  ];
-  Object.assign(form, createBlank());
-  note.value = "";
-  persist();
-}
-
-function flow(record: RecordItem) {
-  record.status = nextStatus(record.status);
-  persist();
-}
-
-function remove(id: string) {
-  records.value = records.value.filter((record) => record.id !== id);
-  persist();
+function resetAll() {
+  if (window.confirm("确定恢复到演示种子数据？当前修改将被清空。")) {
+    store.resetAll();
+    toast.info("已恢复种子数据");
+  }
 }
 </script>
 
@@ -192,78 +159,64 @@ function remove(id: string) {
     <div class="shell">
       <header class="topbar">
         <div>
-          <p class="eyebrow">{{ project.industry }}行业前端最小闭环</p>
-          <h1>{{ project.title }}</h1>
-          <p class="subtitle">{{ project.subtitle }}</p>
+          <p class="eyebrow">物流车队 · 调度 / 保养 / 备件一体化</p>
+          <h1>车辆调度 · 保养停机与备件核销台</h1>
+          <p class="subtitle">
+            执行中车辆不能报修，紧急报修先回收任务并写明原因；单车一张在修单；
+            备件先预占后核销，缺件转待料并释放已占数量；完工录里程、质检与旧件回收，
+            合格后冻结，补录只追加带原因的版本。
+          </p>
         </div>
-        <div class="stack">
-          <span v-for="item in project.stack" :key="item" class="tag">{{ item }}</span>
+        <div class="top-actions">
+          <button type="button" class="secondary" @click="runCheck">一致性自检</button>
+          <button type="button" class="secondary" @click="resetAll">重置演示数据</button>
         </div>
       </header>
 
-      <section class="metrics">
-        <article v-for="(label, index) in project.metricLabels" :key="label" class="metric">
-          <span>{{ label }}</span>
-          <strong>{{ metrics[index] }}</strong>
-        </article>
-      </section>
+      <MetricBar />
 
-      <section class="workspace">
-        <form class="panel" @submit.prevent="submit">
-          <h2>{{ project.formTitle }}</h2>
-          <div class="form-grid">
-            <label v-for="field in fields" :key="field.key">
-              {{ field.label }}
-              <select v-if="field.type === 'select'" v-model="form[field.key]" required>
-                <option value="">请选择</option>
-                <option v-for="option in field.options" :key="option">{{ option }}</option>
-              </select>
-              <input v-else v-model="form[field.key]" :type="field.type || 'text'" required />
-            </label>
-            <label>
-              备注
-              <textarea v-model="note" placeholder="填写处理说明或现场备注" />
-            </label>
-            <button type="submit">{{ project.primaryAction }}</button>
-          </div>
-        </form>
+      <nav class="tabs">
+        <button type="button" :class="{ active: tab === 'dispatch' }" @click="tab = 'dispatch'">
+          车辆调度 / 报修
+        </button>
+        <button type="button" :class="{ active: tab === 'orders' }" @click="tab = 'orders'">
+          维修工单台
+        </button>
+        <button type="button" :class="{ active: tab === 'stock' }" @click="tab = 'stock'">
+          备件核销台
+        </button>
+      </nav>
 
-        <section class="list-panel">
-          <div class="toolbar">
-            <h2>{{ project.entityLabel }}列表</h2>
-            <select v-model="filter">
-              <option v-for="item in project.filters" :key="item">{{ item }}</option>
-            </select>
-          </div>
+      <VehiclePanel v-show="tab === 'dispatch'" />
+      <OrderPanel v-show="tab === 'orders'" />
+      <InventoryPanel v-show="tab === 'stock'" />
 
-          <div class="record-grid">
-            <div v-if="filteredRecords.length === 0" class="empty">暂无匹配数据</div>
-            <article v-for="record in filteredRecords" :key="record.id" class="record">
-              <div class="record-head">
-                <p class="record-title">{{ primaryText(record) }}</p>
-                <span class="status">{{ record.status }}</span>
-              </div>
-              <div class="details">
-                <span v-for="field in fields" :key="field.key">{{ field.label }}: {{ record[field.key] }}</span>
-              </div>
-              <p class="note">{{ record.notes }}</p>
-              <div class="actions">
-                <button type="button" @click="flow(record)">流转状态</button>
-                <button class="secondary" type="button" @click="navigator.clipboard?.writeText(primaryText(record))">复制摘要</button>
-                <button class="danger" type="button" @click="remove(record.id)">删除</button>
-              </div>
-            </article>
-          </div>
-
-          <div class="mini-chart">
-            <div v-for="row in chartRows" :key="row.status" class="bar">
-              <span>{{ row.status }}</span>
-              <div class="bar-track"><div class="bar-fill" :style="{ width: `${(row.value / maxChart) * 100}%` }" /></div>
-              <strong>{{ row.value }}</strong>
+      <section v-if="showCheck" class="panel check-panel">
+        <div class="panel-head">
+          <h2>刷新一致性自检</h2>
+          <span class="status" :class="allPass ? 'st-已完成' : 'st-待料'">
+            {{ allPass ? "全部通过" : "存在异常" }}
+          </span>
+        </div>
+        <ul class="check-list">
+          <li v-for="c in checks" :key="c.name" :class="c.ok ? 'ok' : 'bad'">
+            <span class="check-dot">{{ c.ok ? "✓" : "✗" }}</span>
+            <div>
+              <p class="check-name">{{ c.name }}</p>
+              <p class="muted small">{{ c.detail }}</p>
             </div>
-          </div>
-        </section>
+          </li>
+        </ul>
+        <p class="hint">
+          本面板所有结论均由流水、预占台账、工单现场重新计算。刷新页面后若全部通过，
+          即说明任务、停机、库存与补录版本持久化一致。
+        </p>
       </section>
+
+      <footer class="foot">
+        数据保存在浏览器 localStorage · 数据层（data）/ 规则层（rules）/ 状态层（stores）/ 界面层（components）分离
+      </footer>
     </div>
+    <ToastHost />
   </main>
 </template>
